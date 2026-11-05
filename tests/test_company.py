@@ -112,6 +112,59 @@ class BoardRules(unittest.TestCase):
         with self.assertRaises(BoardError):
             self.b.add_verdict("reviewer", t["id"], c1["id"], "accept", "ok")
 
+    def test_python3_command_matches_python_whitelist(self):
+        t = self.task(["tested"])
+        c = self.b.add_claim("tech", t["id"], "tested", "x",
+                             [{"type": "command", "cmd": "python3 -m unittest no_such_module"}])
+        self.assertEqual(c["status"], "rejected")
+        self.assertEqual(c["decided_by"], "board")
+        self.assertNotIn("白名单", c["reason"])
+
+    def test_verified_followup_clears_human_gate(self):
+        (self.f.parent / "test_ok.py").write_text(
+            "import unittest\n\nclass T(unittest.TestCase):\n"
+            "    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8")
+        t = self.task(["pushed"])
+        c1 = self.b.add_claim("tech", t["id"], "pushed", "x", [{"type": "text", "text": "commit abc123"}])
+        _, closed = self.b.add_verdict("reviewer", t["id"], c1["id"], "accept", "ok")
+        self.assertFalse(closed)
+        self.assertTrue(self.b.task(t["id"])["needs_human"])
+        c2 = self.b.add_claim(
+            "tech", t["id"], "pushed", "y",
+            [{"type": "command", "cmd": 'python -m unittest discover -s deliverables/tech -p test_ok.py'}])
+        self.assertEqual(c2["verification"], "verified")
+        _, closed = self.b.add_verdict("reviewer", t["id"], c2["id"], "accept", "ok")
+        self.assertTrue(closed)
+        self.assertFalse(self.b.task(t["id"])["needs_human"])
+        self.assertEqual(self.b.task(t["id"])["status"], "closed")
+
+    def test_summary_not_waiting_when_claims_missing(self):
+        t = self.task(["done", "pushed"])
+        c = self.b.add_claim("tech", t["id"], "pushed", "x", [{"type": "text", "text": "commit abc123"}])
+        self.b.add_verdict("reviewer", t["id"], c["id"], "accept", "ok")
+        self.assertNotIn("等待人工批准", self.b.summary())
+        self.assertEqual(self.b.waiting_human(), [])
+
+    def test_closed_task_reopens_when_accepted_file_changes(self):
+        t = self.task(["done"])
+        c = self.b.add_claim("tech", t["id"], "done", "x", self.ev)
+        _, closed = self.b.add_verdict("reviewer", t["id"], c["id"], "accept", "ok")
+        self.assertTrue(closed)
+        final = self.ws / "deliverables" / "final_report.md"
+        final.write_text("report", encoding="utf-8")
+        self.b.state["all_closed_sig"] = f"{t['id']}:closed"
+        self.b.save()
+        self.f.write_text("changed", encoding="utf-8")
+        self.assertTrue(self.b.invalidate_stale())
+        task = self.b.task(t["id"])
+        self.assertEqual(task["status"], "open")
+        self.assertNotIn("closed", task)
+        self.assertEqual(task["claims"][0]["status"], "invalidated")
+        self.assertNotIn("all_closed_sig", self.b.state)
+        self.assertFalse(final.exists())
+        self.assertTrue(any(p.name.endswith(".stale.md") for p in final.parent.iterdir()))
+
 
 class OfficeFlow(unittest.TestCase):
     def setUp(self):
@@ -157,6 +210,80 @@ class OfficeFlow(unittest.TestCase):
                                                      "spec": "s", "required": ["done"]}]})
         self.assertEqual(o.apply("chief", "```json\n" + raw + "\n```"), [])
         self.assertIn("新任务 T-001", o.inbox_text("intel"))
+
+    def test_backend_failure_restores_inbox(self):
+        class Boom(MockBackend):
+            def complete(self, *a, **k):
+                raise RuntimeError("down")
+
+        o = self.office
+        o.backend = Boom()
+        o.give_goal("保留")
+        with self.assertRaises(RuntimeError):
+            o.turn("chief")
+        self.assertEqual(o.pending("chief"), 1)
+        self.assertIn("保留", (o.ws / "inbox" / "chief.json").read_text(encoding="utf-8"))
+
+    def test_max_turns_bounds_each_model_call(self):
+        calls = {"n": 0}
+
+        class Counter(MockBackend):
+            def complete(self, system, history, user, meta):
+                calls["n"] += 1
+                return super().complete(system, history, user, meta)
+
+        o = self.office
+        o.backend = Counter()
+        o.give_goal("测试目标")
+        status = o.run(1)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(o.turns, 1)
+        self.assertEqual(status, "budget")
+
+    def test_premature_final_report_is_not_completion(self):
+        o = self.office
+        errs = o._execute("chief", {"actions": [
+            {"type": "final_report", "text": "too early"},
+            {"type": "create_task", "title": "t", "owner": "intel", "spec": "s", "required": ["done"]},
+        ]})
+        self.assertEqual(errs, [])
+        self.assertFalse(o.final_exists())
+        self.assertTrue(o.board.open_tasks())
+        self.assertFalse(o._work_finished())
+        self.assertNotEqual(o.run(0), "done")
+
+    def test_empty_board_final_report_can_finish(self):
+        o = self.office
+        self.assertEqual(o._execute("chief", {"actions": [
+            {"type": "final_report", "text": "nothing to do"}]}), [])
+        self.assertEqual(o.run(3), "done")
+
+    def test_integrity_sync_reopens_and_notifies(self):
+        o = self.office
+        d = o.ws / "deliverables" / "tech"
+        d.mkdir(parents=True)
+        f = d / "a.txt"
+        f.write_text("v1", encoding="utf-8")
+        self.assertEqual(o._execute("chief", {"actions": [{
+            "type": "create_task", "title": "t", "owner": "tech", "spec": "s", "required": ["done"]}]}), [])
+        self.assertEqual(o._execute("tech", {"actions": [
+            {"type": "write_file", "path": "a.txt", "content": "v1"},
+            {"type": "claim", "task_id": "T-001", "kind": "done", "summary": "x",
+             "evidence": [{"type": "file", "path": "a.txt"}]}]}), [])
+        self.assertEqual(o._execute("reviewer", {"actions": [{
+            "type": "verdict", "task_id": "T-001", "claim_id": "C-001",
+            "decision": "accept", "reason": "ok"}]}), [])
+        self.assertEqual(o.board.task("T-001")["status"], "closed")
+        (o.ws / "deliverables" / "final_report.md").write_text("done", encoding="utf-8")
+        f.write_text("v2", encoding="utf-8")
+        o._sync_integrity()
+        self.assertEqual(o.board.task("T-001")["status"], "open")
+        self.assertEqual(o.board.task("T-001")["claims"][0]["status"], "invalidated")
+        self.assertFalse(o.final_exists())
+        tech = json.loads((o.ws / "inbox" / "tech.json").read_text(encoding="utf-8"))
+        chief = json.loads((o.ws / "inbox" / "chief.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(m["event"] == "claim_invalidated" for m in tech))
+        self.assertTrue(any(m["event"] == "task_reopened" for m in chief))
 
 
 if __name__ == "__main__":

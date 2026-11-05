@@ -63,6 +63,24 @@ class Office:
     def _inbox(self, role):
         return self.ws / "inbox" / f"{role}.json"
 
+    def _prepend_inbox(self, role, msgs):
+        p = self._inbox(role)
+        q = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+        p.write_text(json.dumps(list(msgs) + q, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def _sync_integrity(self):
+        """文件哈希变了就作废声明, 并通知负责人; 已关闭任务会重新打开。"""
+        self.board.invalidate_stale()
+        for t, claims, reopened in self.board.pop_invalidations():
+            for c in claims:
+                self.send(t["owner"], "board", "claim_invalidated",
+                          f"系统作废 {c['id']} ({c['kind']}): {c['reason']}",
+                          {"task": t, "claim": c, "reason": c["reason"]})
+            if reopened:
+                self.send(self.chief, "board", "task_reopened",
+                          f"{t['id']} 已重新打开: 通过后文件被改动, 需要重新验收 ({t['title']})",
+                          {"task": t})
+
     def send(self, to, frm, event, text, data=None):
         if to not in self.roles:
             raise BoardError(f"未知角色: {to} (可选: {list(self.roles)})")
@@ -107,15 +125,20 @@ class Office:
         self.send(self.chief, "human", "goal", f"目标: {goal}", {"goal": goal})
 
     def turn(self, role: str) -> bool:
+        self._sync_integrity()
         msgs = self._pop(role)
         if not msgs:
             return False
         user = "\n\n".join(render(m) for m in msgs)
         if role == self.chief:
             user += "\n\n## 当前看板\n" + self.board.summary()
-        raw = self.backend.complete(
-            system=self.system_prompt(role), history=self._history(role), user=user,
-            meta={"role": role, "messages": msgs, "board": self.board.state, "workspace": str(self.ws)})
+        try:
+            raw = self.backend.complete(
+                system=self.system_prompt(role), history=self._history(role), user=user,
+                meta={"role": role, "messages": msgs, "board": self.board.state, "workspace": str(self.ws)})
+        except Exception:
+            self._prepend_inbox(role, msgs)
+            raise
         self._append(role, "user", user)
         self._append(role, "assistant", raw)
         self.turns += 1
@@ -124,6 +147,7 @@ class Office:
         except Exception as e:  # noqa: BLE001
             self.log(f"[#{self.turns}] {self.roles[role]['name']} 回复格式错误: {e}")
             self.send(role, "system", "format_error", f"你的上一条回复不是合法 JSON ({e})。请只输出一个 JSON 对象。")
+            self._sync_integrity()
             return True
         errors = self._execute(role, obj)
         n = len(obj.get("actions") or [])
@@ -137,18 +161,21 @@ class Office:
 
     def _execute(self, role: str, obj: dict):
         errors = []
-        for i, act in enumerate(obj.get("actions") or [], 1):
-            try:
-                if not isinstance(act, dict):
-                    raise BoardError("动作必须是对象")
-                typ = act.get("type")
-                if typ not in self.roles[role]["actions"]:
-                    raise BoardError(f"{role} 无权执行动作 {typ!r}")
-                getattr(self, f"_act_{typ}")(role, act)
-            except KeyError as e:
-                errors.append(f"动作#{i} 缺少字段 {e}")
-            except (BoardError, ValueError, TypeError) as e:
-                errors.append(f"动作#{i} ({act.get('type') if isinstance(act, dict) else act}): {e}")
+        try:
+            for i, act in enumerate(obj.get("actions") or [], 1):
+                try:
+                    if not isinstance(act, dict):
+                        raise BoardError("动作必须是对象")
+                    typ = act.get("type")
+                    if typ not in self.roles[role]["actions"]:
+                        raise BoardError(f"{role} 无权执行动作 {typ!r}")
+                    getattr(self, f"_act_{typ}")(role, act)
+                except KeyError as e:
+                    errors.append(f"动作#{i} 缺少字段 {e}")
+                except (BoardError, ValueError, TypeError) as e:
+                    errors.append(f"动作#{i} ({act.get('type') if isinstance(act, dict) else act}): {e}")
+        finally:
+            self._sync_integrity()
         if errors:
             self.send(role, "system", "action_error", "以下动作被系统拒绝, 请修正:\n- " + "\n- ".join(errors))
         return errors
@@ -243,6 +270,7 @@ class Office:
     # ---------- 人工 ----------
     def approve(self, task_id):
         closed = self.board.approve(task_id)
+        self._sync_integrity()
         if closed:
             t = self.board.task(task_id)
             self.send(self.chief, "human", "task_closed", f"{task_id} 已获人工批准并关闭: {t['title']}")
@@ -252,6 +280,7 @@ class Office:
     # ---------- 手动多会话模式 ----------
     def inbox_text(self, role):
         """取出并渲染某角色的待处理消息, 供你粘贴到该角色的独立聊天会话里。"""
+        self._sync_integrity()
         msgs = self._pop(role)
         if not msgs:
             return ""
@@ -268,21 +297,28 @@ class Office:
     def final_exists(self):
         return (self.ws / "deliverables" / "final_report.md").exists()
 
+    def _work_finished(self):
+        return self.final_exists() and not self.board.open_tasks()
+
     def run(self, max_turns=60):
         start = self.turns
         while self.turns - start < max_turns:
-            if self.final_exists():
+            self._sync_integrity()
+            if self._work_finished():
                 return "done"
             progressed = False
             for role in self.roles:
+                if self.turns - start >= max_turns:
+                    break
                 if self.pending(role):
                     self.turn(role)
                     progressed = True
-                    if self.final_exists():
+                    if self._work_finished():
                         break
             if not progressed:
                 break
-        if self.final_exists():
+        self._sync_integrity()
+        if self._work_finished():
             return "done"
         if self.board.waiting_human():
             return "waiting_human"
@@ -291,4 +327,5 @@ class Office:
         return "stalled"
 
     def reset(self):
-        shutil.rmtree(self.ws, ignore_errors=True)
+        if self.ws.exists():
+            shutil.rmtree(self.ws)

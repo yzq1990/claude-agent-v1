@@ -4,7 +4,7 @@
   1. 每个任务只有一个负责人, 只有负责人能提交声明
   2. 证据由系统观察: 文件哈希由系统计算, 命令由系统执行; 负责人的自述不算证据
   3. 只有审核官的裁决有效; 通过前系统会再次复核证据
-  4. 文件在通过后被改动, 对应声明作废, 需要重新验收
+  4. 文件在通过后被改动, 对应声明作废; 任务已关闭时重新打开, 需要重新验收
   5. 只有文字证据(无法核验)的声明, 关闭任务前还需要人工批准
 """
 from __future__ import annotations
@@ -50,6 +50,7 @@ class Board:
         self.file = self.ws / "board" / "board.json"
         self.allowed = list(allowed_commands)
         self.reviewer_id = reviewer_id
+        self._fresh_invalidations = []
         self.file.parent.mkdir(parents=True, exist_ok=True)
         if self.file.exists():
             self.state = json.loads(self.file.read_text(encoding="utf-8"))
@@ -78,6 +79,12 @@ class Board:
             raise BoardError(f"路径越界: {rel}")
         return p
 
+    def _canon_cmd(self, parts):
+        # python 与 python3 最终都换成当前解释器, 白名单比对须在替换前视为同一命令
+        if parts and parts[0] in ("python", "python3"):
+            return ["python", *parts[1:]]
+        return list(parts)
+
     def _run_command(self, cmd):
         try:
             parts = shlex.split(str(cmd))
@@ -85,14 +92,16 @@ class Board:
             raise BoardError(f"命令无法解析: {e}")
         if not parts:
             raise BoardError("命令为空")
+        canon = self._canon_cmd(parts)
         ok = False
         for a in self.allowed:
-            ap = shlex.split(a)
-            if parts[: len(ap)] == ap:
+            ap = self._canon_cmd(shlex.split(a))
+            if ap and canon[: len(ap)] == ap:
                 ok = True
+                break
         if not ok:
             raise BoardError(f"命令不在白名单: {cmd} (白名单: {self.allowed})")
-        argv = [sys.executable if parts[0] in ("python", "python3") else parts[0]] + parts[1:]
+        argv = [sys.executable if canon[0] == "python" else parts[0]] + parts[1:]
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         try:
             r = subprocess.run(argv, cwd=self.ws, capture_output=True, text=True, timeout=120, env=env)
@@ -121,6 +130,7 @@ class Board:
         t = {"id": tid, "title": str(title), "owner": owner, "spec": str(spec), "required": list(required),
              "status": "open", "claims": [], "needs_human": False, "human_approved": False, "created": now()}
         self.state["tasks"][tid] = t
+        self._void_final_report()
         self.save()
         return t
 
@@ -186,13 +196,79 @@ class Board:
         self.save()
         return claim
 
+    def _void_final_report(self):
+        """已有最终报告时又出现未关闭任务, 这份报告不再算完工。"""
+        p = self.ws / "deliverables" / "final_report.md"
+        if not p.is_file():
+            return
+        stamp = now().replace(":", "").replace(" ", "_")
+        dest = p.with_name(f"final_report.{stamp}.stale.md")
+        n = 0
+        while dest.exists():
+            n += 1
+            dest = p.with_name(f"final_report.{stamp}.{n}.stale.md")
+        p.rename(dest)
+
     def _files_intact(self, claim):
         for e in claim["evidence"]:
-            if e["type"] == "file":
+            if e["type"] != "file":
+                continue
+            try:
                 p = self._resolve(e["path"])
-                if not p.is_file() or sha256_file(p) != e["sha256"]:
-                    return False
+            except BoardError:
+                return False
+            if not p.is_file() or sha256_file(p) != e["sha256"]:
+                return False
         return True
+
+    def _has_replacement(self, t, claim):
+        for other in t["claims"]:
+            if other["id"] == claim["id"] or other["kind"] != claim["kind"]:
+                continue
+            if other["status"] in ("pending", "accepted") and self._files_intact(other):
+                return True
+        return False
+
+    def _invalidate_task(self, t):
+        if t["status"] not in ("open", "closed"):
+            return False
+        announce, was_closed = [], t["status"] == "closed"
+        changed = False
+        for c in t["claims"]:
+            if c["status"] != "accepted" or self._files_intact(c):
+                continue
+            replaced = self._has_replacement(t, c)
+            c["status"] = "invalidated"
+            c["decided_by"] = "board"
+            c["reason"] = "文件在通过后被改动, 声明作废, 请重新提交"
+            changed = True
+            if not replaced:
+                announce.append(c)
+        reopened = False
+        if changed and was_closed and self._missing_kinds(t):
+            t["status"] = "open"
+            t.pop("closed", None)
+            self.state.pop("all_closed_sig", None)
+            self._void_final_report()
+            reopened = True
+        if announce or reopened:
+            self._fresh_invalidations.append((t, announce, reopened))
+        return changed
+
+    def invalidate_stale(self):
+        """把哈希对不上的已通过声明标成作废; 因此缺证据的已关闭任务重新打开。"""
+        changed = False
+        for t in self.state["tasks"].values():
+            if self._invalidate_task(t):
+                changed = True
+        if changed:
+            self.save()
+        return changed
+
+    def pop_invalidations(self):
+        items = self._fresh_invalidations
+        self._fresh_invalidations = []
+        return items
 
     def _reverify(self, claim):
         probs = []
@@ -234,8 +310,9 @@ class Board:
         self.save()
         return claim, closed
 
-    def _missing(self, t):
-        missing, needs_human = [], t.get("needs_human", False)
+    def _missing_kinds(self, t):
+        # 每次按当前声明重算。不能沿用旧的 needs_human, 否则后来补上可核验证据也关不掉任务。
+        missing, needs_human = [], False
         for kind in t["required"]:
             ok = [c for c in t["claims"]
                   if c["kind"] == kind and c["status"] == "accepted" and self._files_intact(c)]
@@ -245,6 +322,10 @@ class Board:
                 needs_human = True
         t["needs_human"] = needs_human
         return missing
+
+    def _missing(self, t):
+        self._invalidate_task(t)
+        return self._missing_kinds(t)
 
     def _try_close(self, t):
         if t["status"] != "open" or self._missing(t):
@@ -266,19 +347,33 @@ class Board:
         return closed
 
     def waiting_human(self):
+        self.invalidate_stale()
         res = [t for t in self.open_tasks()
-               if not self._missing(t) and t["needs_human"] and not t["human_approved"]]
+               if not self._missing_kinds(t) and t["needs_human"] and not t["human_approved"]]
         self.save()
         return res
 
     # ---------- 展示 ----------
+    def _claim_label(self, c):
+        status = c["status"]
+        if status == "accepted" and not self._files_intact(c):
+            status = "invalidated"
+        return f"{c['id']}:{c['kind']}:{status}"
+
     def summary(self):
         lines = []
+        needs_dirty = False
         for t in self.state["tasks"].values():
-            claims = ", ".join(f"{c['id']}:{c['kind']}:{c['status']}"
-                               for c in t["claims"] if c["status"] != "superseded")
-            waiting = t["status"] == "open" and t["needs_human"] and not t["human_approved"]
+            before = t.get("needs_human", False)
+            missing = self._missing_kinds(t)
+            if t.get("needs_human", False) != before:
+                needs_dirty = True
+            claims = ", ".join(self._claim_label(c) for c in t["claims"] if c["status"] != "superseded")
+            waiting = (t["status"] == "open" and not missing and t["needs_human"]
+                       and not t["human_approved"])
             extra = " | 等待人工批准" if waiting else ""
             lines.append(f"{t['id']} [{t['status']}] 负责人={t['owner']} 需要={'/'.join(t['required'])} "
                          f"{t['title']} | 声明: {claims or '无'}{extra}")
+        if needs_dirty:
+            self.save()
         return "\n".join(lines) or "(看板为空)"
