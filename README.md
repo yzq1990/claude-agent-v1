@@ -14,7 +14,7 @@
 ## 快速开始
 
 ```bash
-python -m unittest discover -s tests -v          # 14 个测试, 无需任何依赖
+python -m unittest discover -s tests -v          # 23 个测试, 无需任何依赖
 python run.py run "你的目标"                       # 默认 mock 后端: 离线演示, 不调用模型
 pip install openai && export OPENAI_API_KEY=...
 python run.py run "你的目标" --backend openai   # 真实模型 (默认 gpt-4.1, 可用 COMPANY_MODEL 覆盖)
