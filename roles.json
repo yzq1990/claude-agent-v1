@@ -1,0 +1,14 @@
+{
+  "chief": "chief",
+  "reviewer": "reviewer",
+  "allowed_commands": ["python -m unittest"],
+  "max_history": 40,
+  "roles": {
+    "chief":    {"name": "首席",   "desc": "拆解目标、分派任务、汇总结果; 不亲自产出交付物", "prompt": "roles/chief.md",    "can_own": false, "actions": ["create_task", "cancel_task", "message", "final_report"]},
+    "tech":     {"name": "技术官", "desc": "代码与工程实现, 必须附可运行的测试",           "prompt": "roles/tech.md",     "can_own": true,  "actions": ["write_file", "claim", "message"]},
+    "intel":    {"name": "情报官", "desc": "收集整理信息, 每条结论必须标明来源",           "prompt": "roles/intel.md",    "can_own": true,  "actions": ["write_file", "claim", "message"]},
+    "learning": {"name": "学习官", "desc": "把材料转成学习笔记和自测题",                   "prompt": "roles/learning.md", "can_own": true,  "actions": ["write_file", "claim", "message"]},
+    "creative": {"name": "创意官", "desc": "命名、文案、分镜等创意产出, 给出多个方向",     "prompt": "roles/creative.md", "can_own": true,  "actions": ["write_file", "claim", "message"]},
+    "reviewer": {"name": "审核官", "desc": "独立把关: 对照规格核对证据, 通过或驳回",       "prompt": "roles/reviewer.md", "can_own": false, "actions": ["verdict", "message"]}
+  }
+}
